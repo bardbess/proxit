@@ -117,8 +117,15 @@ async function resolveUpstreamAddress(hostname) {
     throw new Error(`Unable to resolve upstream host outside the hosts file: ${hostname}`);
 }
 
-function toProxyUrl(absoluteUrl) {
-    return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+function getProxyOrigin(req) {
+    const forwardedProtoHeader = req.get('x-forwarded-proto');
+    const protocol = forwardedProtoHeader ? forwardedProtoHeader.split(',')[0].trim() : req.protocol;
+    return `${protocol}://${req.get('host')}`;
+}
+
+function toProxyUrl(absoluteUrl, proxyOrigin = '') {
+    const proxyPath = `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+    return proxyOrigin ? `${proxyOrigin}${proxyPath}` : proxyPath;
 }
 
 function shouldLeaveUrlAlone(path) {
@@ -132,29 +139,72 @@ function shouldLeaveUrlAlone(path) {
     );
 }
 
-function rewriteUrlValue(path, baseUrl) {
+function rewriteUrlValue(path, baseUrl, proxyOrigin = '') {
     if (shouldLeaveUrlAlone(path)) {
         return path;
     }
 
     try {
         const absolute = new URL(path, baseUrl).href;
-        return toProxyUrl(absolute);
+        return toProxyUrl(absolute, proxyOrigin);
     } catch {
         return path;
     }
 }
 
-function rewriteHtmlResourceUrls(html, baseUrl) {
+function rewriteSrcsetValue(value, baseUrl, proxyOrigin = '') {
+    return value
+        .split(',')
+        .map((candidate) => {
+            const trimmed = candidate.trim();
+            if (!trimmed) {
+                return candidate;
+            }
+
+            const parts = trimmed.split(/\s+/);
+            const rewrittenUrl = rewriteUrlValue(parts[0], baseUrl, proxyOrigin);
+            return [rewrittenUrl, ...parts.slice(1)].join(' ');
+        })
+        .join(', ');
+}
+
+function rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin = '') {
+    const resourceAttributesByTag = {
+        a: ['href'],
+        area: ['href'],
+        audio: ['src'],
+        form: ['action'],
+        iframe: ['src'],
+        img: ['src', 'srcset'],
+        input: ['src'],
+        link: ['href'],
+        script: ['src'],
+        source: ['src', 'srcset'],
+        track: ['src'],
+        video: ['src', 'poster'],
+    };
+
     return html.replace(/<[^>]+>/g, (tag) => {
         if (/^<\//.test(tag)) {
             return tag;
         }
 
-        let rewrittenTag = tag.replace(
-            /\b(src|href|action)=["']([^"']*?)["']/gi,
-            (match, attr, path) => `${attr}="${rewriteUrlValue(path, baseUrl)}"`
-        );
+        const tagNameMatch = tag.match(/^<\s*([a-z0-9-]+)/i);
+        const tagName = tagNameMatch ? tagNameMatch[1].toLowerCase() : '';
+        const resourceAttributes = resourceAttributesByTag[tagName] || [];
+        let rewrittenTag = tag;
+
+        for (const attribute of resourceAttributes) {
+            rewrittenTag = rewrittenTag.replace(
+                new RegExp(`\\b(${attribute})=["']([^"']*?)["']`, 'gi'),
+                (match, attr, path) => {
+                    const rewrittenValue = attr.toLowerCase() === 'srcset'
+                        ? rewriteSrcsetValue(path, baseUrl, proxyOrigin)
+                        : rewriteUrlValue(path, baseUrl, proxyOrigin);
+                    return `${attr}="${rewrittenValue}"`;
+                }
+            );
+        }
 
         rewrittenTag = rewrittenTag.replace(/\starget=["']_blank["']/gi, ' target="_self"');
         rewrittenTag = rewrittenTag.replace(/\sintegrity=["'][^"']*["']/gi, '');
@@ -164,7 +214,25 @@ function rewriteHtmlResourceUrls(html, baseUrl) {
     });
 }
 
-function injectProxyClientShim(html) {
+function injectProxyBaseTag(html, baseUrl) {
+    const baseTag = `<base data-proxit-base href="${baseUrl.href}">`;
+
+    if (/<base\b[^>]*data-proxit-base/i.test(html)) {
+        return html.replace(/<base\b[^>]*data-proxit-base[^>]*>/i, baseTag);
+    }
+
+    if (/<head[^>]*>/i.test(html)) {
+        return html.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
+    }
+
+    if (/<html[^>]*>/i.test(html)) {
+        return html.replace(/<html([^>]*)>/i, `<html$1><head>${baseTag}</head>`);
+    }
+
+    return `${baseTag}${html}`;
+}
+
+function injectProxyClientShim(html, proxyOrigin) {
     const shim = `
 <script>
 (() => {
@@ -173,8 +241,11 @@ function injectProxyClientShim(html) {
     }
     window.__proxitShimInstalled = true;
 
-    const proxyOrigin = window.location.origin;
-    const proxyableSchemes = /^(https?:)?\\/\\//i;
+    const proxyOrigin = ${JSON.stringify(proxyOrigin)};
+    const upstreamBase = (() => {
+        const baseElement = document.querySelector('base[data-proxit-base]');
+        return baseElement ? baseElement.href : document.baseURI;
+    })();
     const shouldBypass = (value) => {
         if (!value) {
             return true;
@@ -191,7 +262,7 @@ function injectProxyClientShim(html) {
 
     const toAbsoluteUrl = (value) => {
         try {
-            return new URL(value, window.location.href).href;
+            return new URL(value, upstreamBase).href;
         } catch {
             return value;
         }
@@ -203,7 +274,7 @@ function injectProxyClientShim(html) {
         }
 
         const absoluteUrl = toAbsoluteUrl(value);
-        return '/proxy?url=' + encodeURIComponent(absoluteUrl);
+        return proxyOrigin + '/proxy?url=' + encodeURIComponent(absoluteUrl);
     };
 
     const shouldProxyRequest = (value) => {
@@ -221,6 +292,85 @@ function injectProxyClientShim(html) {
         }
 
         return true;
+    };
+
+    const rewriteSrcsetValue = (value) => {
+        return String(value)
+            .split(',')
+            .map((candidate) => {
+                const trimmed = candidate.trim();
+                if (!trimmed) {
+                    return candidate;
+                }
+
+                const parts = trimmed.split(/\\s+/);
+                const rewrittenUrl = shouldProxyRequest(parts[0]) ? toProxyUrl(parts[0]) : parts[0];
+                return [rewrittenUrl, ...parts.slice(1)].join(' ');
+            })
+            .join(', ');
+    };
+
+    const rewriteMarkupValue = (attributeName, value) => {
+        if (value == null) {
+            return value;
+        }
+
+        const lowerName = String(attributeName).toLowerCase();
+        if (lowerName === 'target' && String(value).toLowerCase() === '_blank') {
+            return '_self';
+        }
+
+        if (lowerName === 'srcset') {
+            return rewriteSrcsetValue(value);
+        }
+
+        if (['src', 'href', 'action', 'poster'].includes(lowerName) && shouldProxyRequest(String(value))) {
+            return toProxyUrl(String(value));
+        }
+
+        return value;
+    };
+
+    const rewriteMarkupTree = (root) => {
+        if (!root || typeof root.querySelectorAll !== 'function') {
+            return root;
+        }
+
+        const elements = [];
+        if (root.nodeType === Node.ELEMENT_NODE) {
+            elements.push(root);
+        }
+        elements.push(...root.querySelectorAll('*'));
+
+        for (const element of elements) {
+            for (const attributeName of ['src', 'href', 'action', 'poster', 'srcset']) {
+                if (element.hasAttribute && element.hasAttribute(attributeName)) {
+                    element.setAttribute(attributeName, rewriteMarkupValue(attributeName, element.getAttribute(attributeName)));
+                }
+            }
+
+            if (element.hasAttribute && element.hasAttribute('target') && element.getAttribute('target').toLowerCase() === '_blank') {
+                element.setAttribute('target', '_self');
+            }
+
+            if (element.removeAttribute) {
+                element.removeAttribute('integrity');
+                element.removeAttribute('crossorigin');
+            }
+        }
+
+        return root;
+    };
+
+    const rewriteHtmlString = (markup) => {
+        if (typeof markup !== 'string' || !markup.includes('<')) {
+            return markup;
+        }
+
+        const template = document.createElement('template');
+        template.innerHTML = markup;
+        rewriteMarkupTree(template.content);
+        return template.innerHTML;
     };
 
     window.open = function(url) {
@@ -291,7 +441,7 @@ function injectProxyClientShim(html) {
                 return descriptor.get.call(this);
             },
             set(value) {
-                const nextValue = shouldProxyRequest(value) ? toProxyUrl(value) : value;
+                const nextValue = rewriteMarkupValue(attributeName, value);
                 descriptor.set.call(this, nextValue);
             }
         });
@@ -300,18 +450,41 @@ function injectProxyClientShim(html) {
     const originalSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function(name, value) {
         const lowerName = String(name).toLowerCase();
-        let nextValue = value;
-
-        if (['src', 'href', 'action', 'srcset'].includes(lowerName) && shouldProxyRequest(String(value))) {
-            nextValue = toProxyUrl(String(value));
-        }
-
-        if (lowerName === 'target' && String(value).toLowerCase() === '_blank') {
-            nextValue = '_self';
-        }
+        const nextValue = rewriteMarkupValue(lowerName, value);
 
         return originalSetAttribute.call(this, name, nextValue);
     };
+
+    const rewriteHtmlSetter = (proto, propertyName) => {
+        const descriptor = Object.getOwnPropertyDescriptor(proto, propertyName);
+        if (!descriptor || !descriptor.set || !descriptor.get) {
+            return;
+        }
+
+        Object.defineProperty(proto, propertyName, {
+            configurable: true,
+            enumerable: descriptor.enumerable,
+            get() {
+                return descriptor.get.call(this);
+            },
+            set(value) {
+                const nextValue = typeof value === 'string' ? rewriteHtmlString(value) : value;
+                descriptor.set.call(this, nextValue);
+                if (propertyName === 'outerHTML' || propertyName === 'innerHTML') {
+                    rewriteMarkupTree(this);
+                }
+            }
+        });
+    };
+
+    const originalInsertAdjacentHTML = Element.prototype.insertAdjacentHTML;
+    Element.prototype.insertAdjacentHTML = function(position, markup) {
+        const rewrittenMarkup = rewriteHtmlString(markup);
+        return originalInsertAdjacentHTML.call(this, position, rewrittenMarkup);
+    };
+
+    rewriteHtmlSetter(Element.prototype, 'innerHTML');
+    rewriteHtmlSetter(Element.prototype, 'outerHTML');
 
     if (window.HTMLImageElement) {
         rewriteAttribute(window.HTMLImageElement.prototype, 'src');
@@ -343,8 +516,66 @@ function injectProxyClientShim(html) {
         rewriteAttribute(window.HTMLFormElement.prototype, 'action');
     }
 
+    const installJQueryHooks = () => {
+        const $ = window.jQuery;
+        if (!$ || $.__proxitHooksInstalled) {
+            return;
+        }
+
+        $.__proxitHooksInstalled = true;
+
+        if (typeof $.ajaxPrefilter === 'function') {
+            $.ajaxPrefilter((options) => {
+                if (options && typeof options.url === 'string' && shouldProxyRequest(options.url)) {
+                    options.url = toProxyUrl(options.url);
+                }
+            });
+        }
+
+        for (const methodName of ['html', 'append', 'prepend', 'before', 'after', 'replaceWith']) {
+            const originalMethod = $.fn[methodName];
+            if (typeof originalMethod !== 'function') {
+                continue;
+            }
+
+            $.fn[methodName] = function(...args) {
+                const rewrittenArgs = args.map((arg) => typeof arg === 'string' ? rewriteHtmlString(arg) : arg);
+                return originalMethod.apply(this, rewrittenArgs);
+            };
+        }
+
+        for (const methodName of ['attr', 'prop']) {
+            const originalMethod = $.fn[methodName];
+            if (typeof originalMethod !== 'function') {
+                continue;
+            }
+
+            $.fn[methodName] = function(name, value) {
+                if (arguments.length >= 2 && typeof name === 'string') {
+                    const nextValue = rewriteMarkupValue(name, value);
+                    return originalMethod.call(this, name, nextValue);
+                }
+                return originalMethod.apply(this, arguments);
+            };
+        }
+    };
+
+    installJQueryHooks();
+    let jqueryHookAttempts = 0;
+    const jqueryHookTimer = window.setInterval(() => {
+        installJQueryHooks();
+        jqueryHookAttempts += 1;
+        if (window.jQuery || jqueryHookAttempts >= 200) {
+            window.clearInterval(jqueryHookTimer);
+        }
+    }, 50);
+
 })();
 </script>`;
+
+    if (/<base\b[^>]*data-proxit-base[^>]*>/i.test(html)) {
+        return html.replace(/(<base\b[^>]*data-proxit-base[^>]*>)/i, `$1${shim}`);
+    }
 
     if (/<head[^>]*>/i.test(html)) {
         return html.replace(/<head([^>]*)>/i, `<head$1>${shim}`);
@@ -357,15 +588,15 @@ function injectProxyClientShim(html) {
     return `${shim}${html}`;
 }
 
-function rewriteCssResourceUrls(css, baseUrl) {
+function rewriteCssResourceUrls(css, baseUrl, proxyOrigin = '') {
     const rewrittenUrls = css.replace(
         /url\((['"]?)([^)'"]+)\1\)/gi,
-        (match, quote, path) => `url(${quote}${rewriteUrlValue(path.trim(), baseUrl)}${quote})`
+        (match, quote, path) => `url(${quote}${rewriteUrlValue(path.trim(), baseUrl, proxyOrigin)}${quote})`
     );
 
     return rewrittenUrls.replace(
         /@import\s+(?:url\()?(['"])([^'"]+)\1\)?/gi,
-        (match, quote, path) => match.replace(path, rewriteUrlValue(path.trim(), baseUrl))
+        (match, quote, path) => match.replace(path, rewriteUrlValue(path.trim(), baseUrl, proxyOrigin))
     );
 }
 
@@ -408,13 +639,13 @@ function rewriteSetCookieHeader(value) {
     });
 }
 
-function rewriteLocationHeader(value, baseUrl) {
+function rewriteLocationHeader(value, baseUrl, proxyOrigin = '') {
     if (!value) {
         return value;
     }
 
     try {
-        return toProxyUrl(new URL(value, baseUrl).href);
+        return toProxyUrl(new URL(value, baseUrl).href, proxyOrigin);
     } catch {
         return value;
     }
@@ -611,6 +842,7 @@ async function proxyRequest(req, res, targetUrl) {
     const requestBody = await readRequestBody(req);
     let target = new URL(targetUrl);
     const storedUpstreamOrigin = getStoredUpstreamOrigin(req);
+    const proxyOrigin = getProxyOrigin(req);
 
     if (
         storedUpstreamOrigin &&
@@ -648,8 +880,9 @@ async function proxyRequest(req, res, targetUrl) {
         const baseUrl = new URL(target.href);
         let html = body.toString('utf8');
 
-        html = rewriteHtmlResourceUrls(html, baseUrl);
-        html = injectProxyClientShim(html);
+        html = injectProxyBaseTag(html, baseUrl);
+        html = rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin);
+        html = injectProxyClientShim(html, proxyOrigin);
         body = Buffer.from(html, 'utf8');
         bodyWasRewritten = true;
         res.cookie(PROXY_ORIGIN_COOKIE, encodeURIComponent(target.origin), {
@@ -659,7 +892,7 @@ async function proxyRequest(req, res, targetUrl) {
         });
     } else if (response.status >= 200 && response.status < 300 && contentType.includes('text/css')) {
         const baseUrl = new URL(target.href);
-        const css = rewriteCssResourceUrls(body.toString('utf8'), baseUrl);
+        const css = rewriteCssResourceUrls(body.toString('utf8'), baseUrl, proxyOrigin);
         body = Buffer.from(css, 'utf8');
         bodyWasRewritten = true;
     }
@@ -698,7 +931,7 @@ async function proxyRequest(req, res, targetUrl) {
                 }
 
                 if (lowerKey === 'location') {
-                    const rewrittenLocation = rewriteLocationHeader(value, target.href);
+                    const rewrittenLocation = rewriteLocationHeader(value, target.href, proxyOrigin);
                     debugLog('rewrote location', {
                         from: value,
                         to: rewrittenLocation,
