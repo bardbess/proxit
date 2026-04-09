@@ -1,13 +1,17 @@
 {
   "name": "proxit",
   "version": "1.0.0",
-  "description": "",
+  "description": "A server-side iframe proxy that rewrites upstream pages for framed browsing.",
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js"
   },
-  "keywords": [],
+  "keywords": [
+    "proxy",
+    "iframe",
+    "express"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
