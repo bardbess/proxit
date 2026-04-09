@@ -1,0 +1,76 @@
+body,
+html {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #0f0f0f;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.header {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    flex-wrap: wrap;
+    background: #1a1a1a;
+    padding: 15px 20px;
+    border-bottom: 1px solid #333;
+}
+
+.title {
+    margin: 0;
+}
+
+#targetUrl {
+    flex: 1;
+    min-width: 320px;
+    padding: 10px 14px;
+    font-size: 16px;
+    background: #222;
+    color: #fff;
+    border: 1px solid #444;
+    border-radius: 6px;
+}
+
+#loadButton {
+    padding: 10px 24px;
+    background: #0066ff;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+#loadButton:hover {
+    background: #3388ff;
+}
+
+#proxyFrame {
+    flex: 1;
+    border: none;
+    background: #fff;
+}
+
+.info {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    background: rgba(0, 0, 0, 0.8);
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 14px;
+    z-index: 10;
+}
+
+.status {
+    margin-top: 8px;
+    font-size: 14px;
+}

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Server-Side Iframe Proxy</title>
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h2 class="title">Server-Side Iframe Proxy</h2>
+
+            <input
+                type="text"
+                id="targetUrl"
+                value="https://httpbin.org/html"
+                placeholder="https://example.com"
+            >
+
+            <button id="loadButton" type="button">Load via Proxy</button>
+        </div>
+
+        <iframe
+            id="proxyFrame"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+        ></iframe>
+    </div>
+
+    <div class="info">
+        Server-side proxy • Bypasses X-Frame-Options & CSP
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

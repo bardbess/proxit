@@ -1,8 +1,20 @@
+const path = require('node:path');
 const express = require('express');
 
 const { PORT } = require('./config');
 const { getProxyTargetUrl, proxyRequest } = require('./lib/proxy-http');
-const { getHomePageHtml } = require('./routes/home-page');
+
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const HOME_PAGE_TEMPLATE = path.join(__dirname, 'templates', 'proxit.html');
+
+function renderProxyError(targetUrl, error) {
+    return `
+            <h2>Proxy Error</h2>
+            <p>Failed to load: ${targetUrl}</p>
+            <p>${error.message}</p>
+            <p>Try a different URL or check your internet connection.</p>
+        `;
+}
 
 function createApp() {
     const app = express();
@@ -13,9 +25,10 @@ function createApp() {
         next();
     });
 
+    app.use(express.static(PUBLIC_DIR));
+
     app.get('/', (req, res) => {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.send(getHomePageHtml());
+        res.sendFile(HOME_PAGE_TEMPLATE);
     });
 
     app.all('/proxy', async (req, res) => {
@@ -29,12 +42,7 @@ function createApp() {
             await proxyRequest(req, res, targetUrl);
         } catch (error) {
             console.error('Proxy error:', error);
-            res.status(500).send(`
-            <h2>Proxy Error</h2>
-            <p>Failed to load: ${targetUrl}</p>
-            <p>${error.message}</p>
-            <p>Try a different URL or check your internet connection.</p>
-        `);
+            res.status(500).send(renderProxyError(targetUrl, error));
         }
     });
 
@@ -52,12 +60,7 @@ function createApp() {
             await proxyRequest(req, res, targetUrl);
         } catch (error) {
             console.error('Proxy error:', error);
-            res.status(500).send(`
-            <h2>Proxy Error</h2>
-            <p>Failed to load: ${targetUrl}</p>
-            <p>${error.message}</p>
-            <p>Try a different URL or check your internet connection.</p>
-        `);
+            res.status(500).send(renderProxyError(targetUrl, error));
         }
     });
 
