@@ -15,6 +15,14 @@ const UPSTREAM_HOST_OVERRIDES = new Set(
         .filter(Boolean)
 );
 const PROXY_ORIGIN_COOKIE = '__proxit_upstream_origin';
+const DIRECT_RESOURCE_HOSTS = [
+    'accounts.google.com',
+    'apis.google.com',
+    'fonts.googleapis.com',
+    'fonts.gstatic.com',
+    'cdnjs.cloudflare.com',
+    'ajax.googleapis.com',
+];
 
 function debugLog(message, details) {
     if (!DEBUG_PROXY) {
@@ -44,7 +52,7 @@ function fetchJson(url) {
             {
                 headers: {
                     Accept: 'application/dns-json, application/json',
-                    'User-Agent': 'Mozilla/5.0 (compatible; ProxyDemo/1.0)',
+                    'User-Agent': 'Mozilla/5.0 (compatible; ProxyIFrame/1.0)',
                 },
             },
             (response) => {
@@ -128,6 +136,44 @@ function toProxyUrl(absoluteUrl, proxyOrigin = '') {
     return proxyOrigin ? `${proxyOrigin}${proxyPath}` : proxyPath;
 }
 
+function unwrapProxyUrl(absoluteUrl, proxyOrigin = '') {
+    let currentUrl = absoluteUrl;
+
+    for (let depth = 0; depth < 5; depth += 1) {
+        try {
+            const parsedUrl = new URL(currentUrl, proxyOrigin || undefined);
+            const isLocalProxyPath = parsedUrl.pathname === '/proxy';
+            const isMatchingOrigin = !proxyOrigin || parsedUrl.origin === proxyOrigin;
+
+            if (!isLocalProxyPath || !isMatchingOrigin) {
+                return parsedUrl.href;
+            }
+
+            const nestedUrl = parsedUrl.searchParams.get('url');
+            if (!nestedUrl) {
+                return parsedUrl.href;
+            }
+
+            currentUrl = nestedUrl;
+        } catch {
+            return currentUrl;
+        }
+    }
+
+    return currentUrl;
+}
+
+function shouldBypassProxyForAbsoluteUrl(absoluteUrl) {
+    try {
+        const url = new URL(absoluteUrl);
+        const hostname = url.hostname.toLowerCase();
+
+        return DIRECT_RESOURCE_HOSTS.some((directHost) => hostname === directHost || hostname.endsWith(`.${directHost}`));
+    } catch {
+        return false;
+    }
+}
+
 function shouldLeaveUrlAlone(path) {
     return (
         !path ||
@@ -146,6 +192,9 @@ function rewriteUrlValue(path, baseUrl, proxyOrigin = '') {
 
     try {
         const absolute = new URL(path, baseUrl).href;
+        if (shouldBypassProxyForAbsoluteUrl(absolute)) {
+            return absolute;
+        }
         return toProxyUrl(absolute, proxyOrigin);
     } catch {
         return path;
@@ -184,7 +233,17 @@ function rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin = '') {
         video: ['src', 'poster'],
     };
 
-    return html.replace(/<[^>]+>/g, (tag) => {
+    const preservedBlocks = [];
+    const protectedHtml = html.replace(
+        /<(script|style|textarea|noscript)\b[\s\S]*?<\/\1>/gi,
+        (block) => {
+            const token = `__PROXIT_PRESERVED_BLOCK_${preservedBlocks.length}__`;
+            preservedBlocks.push(block);
+            return token;
+        }
+    );
+
+    const rewrittenHtml = protectedHtml.replace(/<[^>]+>/g, (tag) => {
         if (/^<\//.test(tag)) {
             return tag;
         }
@@ -212,6 +271,8 @@ function rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin = '') {
 
         return rewrittenTag;
     });
+
+    return rewrittenHtml.replace(/__PROXIT_PRESERVED_BLOCK_(\d+)__/g, (match, index) => preservedBlocks[Number(index)] || match);
 }
 
 function injectProxyBaseTag(html, baseUrl) {
@@ -242,6 +303,7 @@ function injectProxyClientShim(html, proxyOrigin) {
     window.__proxitShimInstalled = true;
 
     const proxyOrigin = ${JSON.stringify(proxyOrigin)};
+    const directResourceHosts = ${JSON.stringify(DIRECT_RESOURCE_HOSTS)};
     const upstreamBase = (() => {
         const baseElement = document.querySelector('base[data-proxit-base]');
         return baseElement ? baseElement.href : document.baseURI;
@@ -268,12 +330,25 @@ function injectProxyClientShim(html, proxyOrigin) {
         }
     };
 
+    const shouldBypassProxyForAbsoluteUrl = (absoluteUrl) => {
+        try {
+            const url = new URL(absoluteUrl);
+            const hostname = url.hostname.toLowerCase();
+            return directResourceHosts.some((directHost) => hostname === directHost || hostname.endsWith('.' + directHost));
+        } catch {
+            return false;
+        }
+    };
+
     const toProxyUrl = (value) => {
         if (shouldBypass(value)) {
             return value;
         }
 
         const absoluteUrl = toAbsoluteUrl(value);
+        if (shouldBypassProxyForAbsoluteUrl(absoluteUrl)) {
+            return absoluteUrl;
+        }
         return proxyOrigin + '/proxy?url=' + encodeURIComponent(absoluteUrl);
     };
 
@@ -283,6 +358,10 @@ function injectProxyClientShim(html, proxyOrigin) {
         }
 
         const absoluteUrl = toAbsoluteUrl(value);
+        if (shouldBypassProxyForAbsoluteUrl(absoluteUrl)) {
+            return false;
+        }
+
         if (!/^https?:/i.test(absoluteUrl)) {
             return false;
         }
@@ -345,7 +424,11 @@ function injectProxyClientShim(html, proxyOrigin) {
         for (const element of elements) {
             for (const attributeName of ['src', 'href', 'action', 'poster', 'srcset']) {
                 if (element.hasAttribute && element.hasAttribute(attributeName)) {
-                    element.setAttribute(attributeName, rewriteMarkupValue(attributeName, element.getAttribute(attributeName)));
+                    const currentValue = element.getAttribute(attributeName);
+                    const nextValue = rewriteMarkupValue(attributeName, currentValue);
+                    if (nextValue !== currentValue) {
+                        element.setAttribute(attributeName, nextValue);
+                    }
                 }
             }
 
@@ -368,9 +451,14 @@ function injectProxyClientShim(html, proxyOrigin) {
         }
 
         const template = document.createElement('template');
-        template.innerHTML = markup;
+        const templateDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+        if (!templateDescriptor || !templateDescriptor.set || !templateDescriptor.get) {
+            return markup;
+        }
+
+        templateDescriptor.set.call(template, markup);
         rewriteMarkupTree(template.content);
-        return template.innerHTML;
+        return templateDescriptor.get.call(template);
     };
 
     window.open = function(url) {
@@ -388,6 +476,37 @@ function injectProxyClientShim(html, proxyOrigin) {
 
         event.preventDefault();
         window.location.href = link.href;
+    }, true);
+
+    const getFormSubmissionTarget = (form) => {
+        const rawAction = form.getAttribute('action');
+        if (!rawAction) {
+            return upstreamBase;
+        }
+
+        if (shouldBypass(rawAction)) {
+            return rawAction;
+        }
+
+        return toAbsoluteUrl(rawAction);
+    };
+
+    document.addEventListener('submit', (event) => {
+        const form = event.target;
+        if (!(form instanceof HTMLFormElement)) {
+            return;
+        }
+
+        const submissionTarget = getFormSubmissionTarget(form);
+        if (!submissionTarget || shouldBypass(submissionTarget)) {
+            return;
+        }
+
+        form.setAttribute('action', toProxyUrl(submissionTarget));
+        const target = form.getAttribute('target');
+        if (target && target.toLowerCase() === '_blank') {
+            form.setAttribute('target', '_self');
+        }
     }, true);
 
     const originalFetch = window.fetch && window.fetch.bind(window);
@@ -455,36 +574,11 @@ function injectProxyClientShim(html, proxyOrigin) {
         return originalSetAttribute.call(this, name, nextValue);
     };
 
-    const rewriteHtmlSetter = (proto, propertyName) => {
-        const descriptor = Object.getOwnPropertyDescriptor(proto, propertyName);
-        if (!descriptor || !descriptor.set || !descriptor.get) {
-            return;
-        }
-
-        Object.defineProperty(proto, propertyName, {
-            configurable: true,
-            enumerable: descriptor.enumerable,
-            get() {
-                return descriptor.get.call(this);
-            },
-            set(value) {
-                const nextValue = typeof value === 'string' ? rewriteHtmlString(value) : value;
-                descriptor.set.call(this, nextValue);
-                if (propertyName === 'outerHTML' || propertyName === 'innerHTML') {
-                    rewriteMarkupTree(this);
-                }
-            }
-        });
-    };
-
     const originalInsertAdjacentHTML = Element.prototype.insertAdjacentHTML;
     Element.prototype.insertAdjacentHTML = function(position, markup) {
         const rewrittenMarkup = rewriteHtmlString(markup);
         return originalInsertAdjacentHTML.call(this, position, rewrittenMarkup);
     };
-
-    rewriteHtmlSetter(Element.prototype, 'innerHTML');
-    rewriteHtmlSetter(Element.prototype, 'outerHTML');
 
     if (window.HTMLImageElement) {
         rewriteAttribute(window.HTMLImageElement.prototype, 'src');
@@ -515,6 +609,21 @@ function injectProxyClientShim(html, proxyOrigin) {
     if (window.HTMLFormElement) {
         rewriteAttribute(window.HTMLFormElement.prototype, 'action');
     }
+
+    const mutationObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+            if (mutation.type === 'childList') {
+                mutation.addedNodes.forEach((node) => {
+                    rewriteMarkupTree(node);
+                });
+            }
+        }
+    });
+
+    mutationObserver.observe(document.documentElement || document, {
+        subtree: true,
+        childList: true,
+    });
 
     const installJQueryHooks = () => {
         const $ = window.jQuery;
@@ -701,9 +810,19 @@ function buildUpstreamHeaders(req, targetUrl, body) {
     delete headers['accept-encoding'];
     delete headers['if-none-match'];
     delete headers['if-modified-since'];
+    delete headers.cookie;
+    delete headers.origin;
+    delete headers.referer;
+
+    for (const headerName of Object.keys(headers)) {
+        const lowerHeaderName = headerName.toLowerCase();
+        if (lowerHeaderName.startsWith('sec-fetch-') || lowerHeaderName.startsWith('sec-ch-')) {
+            delete headers[headerName];
+        }
+    }
 
     if (!headers['user-agent']) {
-        headers['user-agent'] = 'Mozilla/5.0 (compatible; ProxyDemo/1.0)';
+        headers['user-agent'] = 'Mozilla/5.0 (compatible; ProxyIFrame/1.0)';
     }
 
     headers['accept-encoding'] = 'identity';
@@ -731,7 +850,7 @@ async function fetchUpstream(targetUrl, options = {}) {
         path: `${url.pathname}${url.search}`,
         method: options.method || 'GET',
         headers: options.headers || {
-            'User-Agent': 'Mozilla/5.0 (compatible; ProxyDemo/1.0)',
+            'User-Agent': 'Mozilla/5.0 (compatible; ProxyIFrame/1.0)',
         },
     };
 
@@ -787,7 +906,7 @@ async function fetchUpstream(targetUrl, options = {}) {
 
 function getProxyTargetUrl(req) {
     if (req.path === '/proxy' && typeof req.query.url === 'string' && req.query.url) {
-        return req.query.url;
+        return unwrapProxyUrl(req.query.url, getProxyOrigin(req));
     }
 
     const referer = req.get('referer');
@@ -807,6 +926,21 @@ function getProxyTargetUrl(req) {
         }
 
         const upstreamBaseUrl = new URL(upstreamPageUrl);
+        if (req.path === '/proxy') {
+            const proxyRequestUrl = new URL(req.originalUrl, getProxyOrigin(req));
+            const derivedUrl = new URL(upstreamBaseUrl.href);
+            const submittedParams = new URLSearchParams(proxyRequestUrl.search);
+            submittedParams.delete('url');
+            derivedUrl.search = submittedParams.toString() ? `?${submittedParams.toString()}` : '';
+            debugLog('derived proxy target from referer page', {
+                method: req.method,
+                originalUrl: req.originalUrl,
+                referer,
+                derivedUrl: derivedUrl.href,
+            });
+            return derivedUrl.href;
+        }
+
         const resolvedUrl = new URL(req.originalUrl, upstreamBaseUrl.origin).href;
         debugLog('derived same-origin target', {
             method: req.method,
@@ -875,6 +1009,11 @@ async function proxyRequest(req, res, targetUrl) {
     let contentType = response.headers['content-type'] || 'text/html';
     let body = response.body;
     let bodyWasRewritten = false;
+    const targetPathname = new URL(target.href).pathname.toLowerCase();
+
+    if ((targetPathname.endsWith('.js') || targetPathname.endsWith('.mjs')) && (!contentType || contentType.startsWith('text/plain'))) {
+        contentType = 'application/javascript; charset=utf-8';
+    }
 
     if (response.status >= 200 && response.status < 300 && contentType.includes('text/html')) {
         const baseUrl = new URL(target.href);
@@ -920,6 +1059,10 @@ async function proxyRequest(req, res, targetUrl) {
                     return;
                 }
 
+                if ((targetPathname.endsWith('.js') || targetPathname.endsWith('.mjs')) && lowerKey === 'x-content-type-options') {
+                    return;
+                }
+
                 if (lowerKey === 'set-cookie') {
                     const rewrittenCookies = rewriteSetCookieHeader(value);
                     debugLog('rewrote set-cookie', {
@@ -957,7 +1100,7 @@ async function proxyRequest(req, res, targetUrl) {
     res.send(body);
 }
 
-// Basic security headers for your own demo page
+// Basic security headers
 app.use((req, res, next) => {
     res.setHeader('X-Frame-Options', 'ALLOWALL'); // or 'SAMEORIGIN' if you prefer
     res.setHeader('Content-Security-Policy', "frame-ancestors 'self' *;"); // allow framing
@@ -973,7 +1116,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Server-Side Proxy Iframe Demo</title>
+    <title>Server-Side Iframe Proxy</title>
     <style>
         body, html { margin:0; padding:0; height:100%; background:#0f0f0f; color:#eee; font-family:system-ui, sans-serif; }
         .container { display:flex; flex-direction:column; height:100%; }
@@ -1001,7 +1144,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin:0;">Server-Side Proxy Iframe Demo</h2>
+            <h2 style="margin:0;">Server-Side Iframe Proxy</h2>
 
             <input type="text" id="targetUrl"
                    value="https://httpbin.org/html"
@@ -1018,11 +1161,86 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
+        const TARGET_URL_STORAGE_KEY = 'proxit:last-target-url';
+
+        function normalizeTargetUrl(rawValue) {
+            const value = String(rawValue || '').trim();
+            if (!value) {
+                return '';
+            }
+
+            const withProtocol = value.startsWith('http://') || value.startsWith('https://') ? value : 'https://' + value;
+
+            try {
+                let currentUrl = new URL(withProtocol, window.location.origin);
+                for (let depth = 0; depth < 5; depth += 1) {
+                    if (currentUrl.origin !== window.location.origin || currentUrl.pathname !== '/proxy') {
+                        return currentUrl.href;
+                    }
+
+                    const nestedUrl = currentUrl.searchParams.get('url');
+                    if (!nestedUrl) {
+                        return currentUrl.href;
+                    }
+
+                    currentUrl = new URL(nestedUrl, window.location.origin);
+                }
+
+                return currentUrl.href;
+            } catch {
+                return withProtocol;
+            }
+        }
+
+        function persistTargetUrl(url) {
+            const normalizedUrl = normalizeTargetUrl(url);
+            if (!normalizedUrl) {
+                return;
+            }
+
+            const input = document.getElementById('targetUrl');
+            input.value = normalizedUrl;
+            window.localStorage.setItem(TARGET_URL_STORAGE_KEY, normalizedUrl);
+        }
+
+        function getInitialTargetUrl() {
+            return normalizeTargetUrl(window.localStorage.getItem(TARGET_URL_STORAGE_KEY) || 'https://httpbin.org/html');
+        }
+
+        function getUpstreamUrlFromIframe() {
+            const iframe = document.getElementById('proxyFrame');
+
+            try {
+                const iframeUrl = new URL(iframe.contentWindow.location.href);
+                if (iframeUrl.pathname === '/proxy') {
+                    const proxiedUrl = iframeUrl.searchParams.get('url');
+                    if (proxiedUrl) {
+                        return proxiedUrl;
+                    }
+                }
+
+                const iframeDocument = iframe.contentDocument;
+                const baseElement = iframeDocument && iframeDocument.querySelector('base[data-proxit-base]');
+                if (baseElement && baseElement.href) {
+                    return baseElement.href;
+                }
+
+                if (/^https?:/i.test(iframeUrl.href)) {
+                    return iframeUrl.href;
+                }
+            } catch {
+                return '';
+            }
+
+            return '';
+        }
+
         async function loadIframe() {
             let url = document.getElementById('targetUrl').value.trim();
             if (!url) return alert("Enter a URL");
 
-            if (!url.startsWith('http')) url = 'https://' + url;
+            url = normalizeTargetUrl(url);
+            persistTargetUrl(url);
 
             const proxyUrl = '/proxy?url=' + encodeURIComponent(url);
             const iframe = document.getElementById('proxyFrame');
@@ -1036,7 +1254,9 @@ app.get('/', (req, res) => {
             document.querySelector('.header').appendChild(status);
 
             iframe.onload = () => {
-                status.textContent = 'Loaded: ' + url;
+                const activeUrl = getUpstreamUrlFromIframe() || url;
+                persistTargetUrl(activeUrl);
+                status.textContent = 'Loaded: ' + activeUrl;
                 setTimeout(() => status.remove(), 3000);
             };
         }
@@ -1046,8 +1266,9 @@ app.get('/', (req, res) => {
             if (e.key === 'Enter') loadIframe();
         });
 
-        // Auto load demo on start
+        // Auto load on start
         window.addEventListener('load', () => {
+            document.getElementById('targetUrl').value = getInitialTargetUrl();
             setTimeout(loadIframe, 500);
         });
     </script>
@@ -1060,7 +1281,7 @@ app.get('/', (req, res) => {
 // PROXY ROUTE
 // ======================
 app.all('/proxy', async (req, res) => {
-    let targetUrl = req.query.url;
+    const targetUrl = getProxyTargetUrl(req);
 
     if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
         return res.status(400).send('Invalid or missing URL parameter');
