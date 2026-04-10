@@ -59,8 +59,44 @@ function readRequestBody(req) {
     });
 }
 
+function rewriteUpstreamRequestContextUrl(value, req, targetUrl) {
+    if (!value) {
+        return null;
+    }
+
+    try {
+        const parsedValue = new URL(value, getProxyOrigin(req));
+        const proxyOrigin = getProxyOrigin(req);
+
+        if (parsedValue.origin === proxyOrigin && parsedValue.pathname === '/proxy') {
+            const upstreamUrl = parsedValue.searchParams.get('url');
+            if (upstreamUrl) {
+                return unwrapProxyUrl(upstreamUrl, proxyOrigin);
+            }
+        }
+
+        if (parsedValue.origin === proxyOrigin) {
+            const storedUpstreamOrigin = getStoredUpstreamOrigin(req);
+            if (storedUpstreamOrigin) {
+                return new URL(`${parsedValue.pathname}${parsedValue.search}`, storedUpstreamOrigin).href;
+            }
+        }
+
+        return new URL(value).href;
+    } catch {
+        try {
+            return new URL(value, targetUrl.origin).href;
+        } catch {
+            return null;
+        }
+    }
+}
+
 function buildUpstreamHeaders(req, targetUrl, body) {
     const headers = { ...req.headers };
+    const incomingCookies = parseCookies(req);
+    const upstreamReferer = rewriteUpstreamRequestContextUrl(req.headers.referer, req, targetUrl);
+    const upstreamOrigin = rewriteUpstreamRequestContextUrl(req.headers.origin, req, targetUrl);
 
     delete headers.host;
     delete headers.connection;
@@ -68,7 +104,6 @@ function buildUpstreamHeaders(req, targetUrl, body) {
     delete headers['accept-encoding'];
     delete headers['if-none-match'];
     delete headers['if-modified-since'];
-    delete headers.cookie;
     delete headers.origin;
     delete headers.referer;
 
@@ -84,6 +119,24 @@ function buildUpstreamHeaders(req, targetUrl, body) {
     }
 
     headers['accept-encoding'] = 'identity';
+
+    if (upstreamReferer) {
+        headers.referer = upstreamReferer;
+    }
+
+    if (upstreamOrigin) {
+        headers.origin = upstreamOrigin;
+    }
+
+    const forwardedCookies = Object.entries(incomingCookies)
+        .filter(([name]) => name !== PROXY_ORIGIN_COOKIE)
+        .map(([name, value]) => `${name}=${value}`);
+
+    if (forwardedCookies.length > 0) {
+        headers.cookie = forwardedCookies.join('; ');
+    } else {
+        delete headers.cookie;
+    }
 
     if (body.length > 0) {
         headers['content-length'] = String(body.length);
@@ -181,6 +234,24 @@ function getProxyTargetUrl(req) {
         }
     }
 
+    if (req.path !== '/proxy' && typeof req.query.url === 'string' && req.query.url) {
+        try {
+            const hintedUrl = new URL(unwrapProxyUrl(req.query.url, getProxyOrigin(req)));
+            const requestUrl = new URL(req.originalUrl, hintedUrl.origin);
+
+            debugLog('derived hinted-origin target', {
+                method: req.method,
+                originalUrl: req.originalUrl,
+                hintedOrigin: hintedUrl.origin,
+                resolvedUrl: requestUrl.href,
+            });
+
+            return requestUrl.href;
+        } catch {
+            // Fall through to referer/cookie-based mapping.
+        }
+    }
+
     const referer = req.get('referer');
     if (!referer) {
         return null;
@@ -251,20 +322,46 @@ function globalizeClassicScriptHelpers(javascript) {
         .replace(/\bconst \$ =/g, 'window.$ =');
 }
 
-async function proxyRequest(req, res, targetUrl) {
-    const requestBody = await readRequestBody(req);
+function normalizeUpstreamTargetUrl(targetUrl, storedUpstreamOrigin) {
     let target = new URL(targetUrl);
-    const storedUpstreamOrigin = getStoredUpstreamOrigin(req);
-    const proxyOrigin = getProxyOrigin(req);
 
     if (
         storedUpstreamOrigin &&
         (target.hostname === 'localhost' || target.hostname === '127.0.0.1') &&
         String(target.port || PORT) === String(PORT)
     ) {
-        const originalTargetUrl = target.href;
         target = new URL(`${target.pathname}${target.search}`, storedUpstreamOrigin);
+    }
+
+    if (
+        target.protocol === 'http:' &&
+        target.port === String(PORT) &&
+        target.hostname !== 'localhost' &&
+        target.hostname !== '127.0.0.1'
+    ) {
+        target = new URL(target.href);
+        target.port = '';
+    }
+
+    return target;
+}
+
+async function proxyRequest(req, res, targetUrl) {
+    const requestBody = await readRequestBody(req);
+    const storedUpstreamOrigin = getStoredUpstreamOrigin(req);
+    const proxyOrigin = getProxyOrigin(req);
+    const originalTargetUrl = targetUrl;
+    let target = normalizeUpstreamTargetUrl(targetUrl, storedUpstreamOrigin);
+
+    if (storedUpstreamOrigin && target.href !== originalTargetUrl) {
         debugLog('remapped self-proxy target', {
+            originalTargetUrl,
+            remappedTargetUrl: target.href,
+        });
+    }
+
+    if (!storedUpstreamOrigin && target.href !== originalTargetUrl) {
+        debugLog('stripped leaked proxy port from upstream target', {
             originalTargetUrl,
             remappedTargetUrl: target.href,
         });
@@ -300,7 +397,7 @@ async function proxyRequest(req, res, targetUrl) {
         contentType.includes('javascript') &&
         req.path !== '/proxy';
 
-    if (response.status >= 200 && response.status < 300 && contentType.includes('text/html')) {
+    if (contentType.includes('text/html')) {
         const baseUrl = new URL(target.href);
         let html = body.toString('utf8');
 
@@ -403,7 +500,10 @@ async function proxyRequest(req, res, targetUrl) {
 }
 
 module.exports = {
+    buildUpstreamHeaders,
     getProxyTargetUrl,
     globalizeClassicScriptHelpers,
+    normalizeUpstreamTargetUrl,
     proxyRequest,
+    rewriteUpstreamRequestContextUrl,
 };

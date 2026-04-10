@@ -11,7 +11,7 @@ function rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin = '') {
         area: ['href'],
         audio: ['src'],
         form: ['action'],
-        iframe: ['src'],
+        iframe: ['src', 'srcdoc'],
         img: ['src', 'srcset'],
         input: ['src'],
         link: ['href'],
@@ -235,6 +235,10 @@ function injectProxyClientShim(html, proxyOrigin) {
             return rewriteSrcsetValue(value);
         }
 
+        if (lowerName === 'srcdoc') {
+            return rewriteHtmlString(String(value));
+        }
+
         if (['src', 'href', 'action', 'poster'].includes(lowerName) && shouldProxyRequest(String(value))) {
             return toProxyUrl(String(value));
         }
@@ -277,20 +281,21 @@ function injectProxyClientShim(html, proxyOrigin) {
         return root;
     };
 
+    const nativeInnerHtmlDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+
     const rewriteHtmlString = (markup) => {
         if (typeof markup !== 'string' || !markup.includes('<')) {
             return markup;
         }
 
         const template = document.createElement('template');
-        const templateDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
-        if (!templateDescriptor || !templateDescriptor.set || !templateDescriptor.get) {
+        if (!nativeInnerHtmlDescriptor || !nativeInnerHtmlDescriptor.set || !nativeInnerHtmlDescriptor.get) {
             return markup;
         }
 
-        templateDescriptor.set.call(template, markup);
+        nativeInnerHtmlDescriptor.set.call(template, markup);
         rewriteMarkupTree(template.content);
-        return templateDescriptor.get.call(template);
+        return nativeInnerHtmlDescriptor.get.call(template);
     };
 
     window.open = function(url) {
@@ -314,6 +319,47 @@ function injectProxyClientShim(html, proxyOrigin) {
         }
 
         notifyParentNavigation(link.href || toProxyUrl(href));
+    }, true);
+
+    document.addEventListener('click', (event) => {
+        const button = event.target.closest && event.target.closest('.load_iframe_btn');
+        if (!button) {
+            return;
+        }
+
+        const placeholder = button.closest && button.closest('.iframe_placeholder[data-iframe]');
+        if (!placeholder) {
+            return;
+        }
+
+        const iframeMarkup = placeholder.getAttribute('data-iframe');
+        if (!iframeMarkup) {
+            return;
+        }
+
+        event.preventDefault();
+
+        const template = document.createElement('template');
+        template.innerHTML = rewriteHtmlString(iframeMarkup);
+        const iframe = template.content.querySelector('iframe');
+        if (!iframe) {
+            return;
+        }
+
+        const gameFrame = placeholder.closest && placeholder.closest('.game_frame');
+        if (gameFrame) {
+            gameFrame.classList.add('game_loaded');
+            gameFrame.classList.remove('game_pending');
+        }
+
+        notifyParentNavigation(iframe.getAttribute('src') || iframe.src);
+        placeholder.replaceWith(iframe);
+
+        window.setTimeout(() => {
+            if (typeof iframe.focus === 'function') {
+                iframe.focus();
+            }
+        }, 100);
     }, true);
 
     document.addEventListener('click', (event) => {
@@ -431,6 +477,20 @@ function injectProxyClientShim(html, proxyOrigin) {
         };
     }
 
+    if (navigator.serviceWorker && typeof navigator.serviceWorker.register === 'function') {
+        navigator.serviceWorker.register = function() {
+            return Promise.resolve({
+                scope: window.location.origin + '/',
+                unregister() {
+                    return Promise.resolve(true);
+                },
+                update() {
+                    return Promise.resolve();
+                },
+            });
+        };
+    }
+
     const rewriteAttribute = (proto, attributeName) => {
         const descriptor = Object.getOwnPropertyDescriptor(proto, attributeName);
         if (!descriptor || !descriptor.set || !descriptor.get) {
@@ -492,6 +552,11 @@ function injectProxyClientShim(html, proxyOrigin) {
 
     if (window.HTMLFormElement) {
         rewriteAttribute(window.HTMLFormElement.prototype, 'action');
+    }
+
+    if (window.HTMLIFrameElement) {
+        rewriteAttribute(window.HTMLIFrameElement.prototype, 'src');
+        rewriteAttribute(window.HTMLIFrameElement.prototype, 'srcdoc');
     }
 
     const mutationObserver = new MutationObserver((mutations) => {

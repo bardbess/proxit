@@ -4,13 +4,11 @@ const DEFAULT_UPSTREAM_DOH_URL = 'https://dns.google/resolve';
 const DIRECT_RESOURCE_HOSTS = [
     'accounts.google.com',
     'apis.google.com',
-    'www.google.com',
-    'www.gstatic.com',
-    'www.recaptcha.net',
     'fonts.googleapis.com',
     'fonts.gstatic.com',
     'cdnjs.cloudflare.com',
     'ajax.googleapis.com',
+    'transcend-cdn.com',
 ];
 
 const BYPASS_ALL_UPSTREAM_HOSTS = process.env.UPSTREAM_HOST_OVERRIDES === '*';

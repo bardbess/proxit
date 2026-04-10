@@ -1,4 +1,24 @@
 const { BYPASS_ALL_UPSTREAM_HOSTS, DIRECT_RESOURCE_HOSTS, UPSTREAM_HOST_OVERRIDES } = require('../config');
+const RECAPTCHA_HOSTS = ['www.google.com', 'www.recaptcha.net', 'www.gstatic.com'];
+const NUMBERED_DIRECT_HOST_SUFFIXES = [];
+const DIRECT_PATH_RULES = [
+    {
+        hosts: ['www.youtube.com', 'youtube.com', 'www.youtube-nocookie.com', 'youtube-nocookie.com'],
+        pathPrefixes: ['/embed/', '/s/_/ytembeds/'],
+    },
+];
+const DIRECT_HOST_SUFFIXES = ['googlevideo.com', 'ytimg.com'];
+
+function isLocalDevelopmentHost(hostname) {
+    const normalizedHostname = String(hostname || '').toLowerCase();
+
+    return (
+        normalizedHostname === 'localhost' ||
+        normalizedHostname === '127.0.0.1' ||
+        normalizedHostname === '::1' ||
+        normalizedHostname.endsWith('.localhost')
+    );
+}
 
 function shouldBypassHostsFile(hostname) {
     if (BYPASS_ALL_UPSTREAM_HOSTS) {
@@ -50,6 +70,40 @@ function shouldBypassProxyForAbsoluteUrl(absoluteUrl) {
     try {
         const url = new URL(absoluteUrl);
         const hostname = url.hostname.toLowerCase();
+        const pathname = url.pathname;
+
+        if (isLocalDevelopmentHost(hostname)) {
+            return true;
+        }
+
+        const isRecaptchaHost = (
+            RECAPTCHA_HOSTS.includes(hostname) &&
+            pathname.startsWith('/recaptcha/')
+        );
+
+        const isNumberedDirectHost = NUMBERED_DIRECT_HOST_SUFFIXES.some(
+            (suffix) => new RegExp(`^c\\d+\\.${suffix.replace('.', '\\.')}$`, 'i').test(hostname)
+        );
+
+        if (isRecaptchaHost || isNumberedDirectHost) {
+            return true;
+        }
+
+        const matchesDirectPathRule = DIRECT_PATH_RULES.some(
+            (rule) => rule.hosts.includes(hostname) && rule.pathPrefixes.some((prefix) => pathname.startsWith(prefix))
+        );
+
+        if (matchesDirectPathRule) {
+            return true;
+        }
+
+        const matchesDirectHostSuffix = DIRECT_HOST_SUFFIXES.some(
+            (suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`)
+        );
+
+        if (matchesDirectHostSuffix) {
+            return true;
+        }
 
         return DIRECT_RESOURCE_HOSTS.some((directHost) => hostname === directHost || hostname.endsWith(`.${directHost}`));
     } catch {
@@ -133,6 +187,12 @@ function rewriteLocationHeader(value, baseUrl, proxyOrigin = '') {
 }
 
 module.exports = {
+    DIRECT_RESOURCE_HOSTS,
+    DIRECT_HOST_SUFFIXES,
+    DIRECT_PATH_RULES,
+    NUMBERED_DIRECT_HOST_SUFFIXES,
+    RECAPTCHA_HOSTS,
+    isLocalDevelopmentHost,
     shouldBypassHostsFile,
     getProxyOrigin,
     toProxyUrl,
