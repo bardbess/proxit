@@ -43,8 +43,9 @@ function rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin = '') {
 
         for (const attribute of resourceAttributes) {
             rewrittenTag = rewrittenTag.replace(
-                new RegExp(`\\b(${attribute})=["']([^"']*?)["']`, 'gi'),
-                (match, attr, path) => {
+                new RegExp(`\\b(${attribute})=(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'gi'),
+                (match, attr, doubleQuotedPath, singleQuotedPath, unquotedPath) => {
+                    const path = doubleQuotedPath ?? singleQuotedPath ?? unquotedPath ?? '';
                     const rewrittenValue = attr.toLowerCase() === 'srcset'
                         ? rewriteSrcsetValue(path, baseUrl, proxyOrigin)
                         : rewriteUrlValue(path, baseUrl, proxyOrigin);
@@ -60,7 +61,21 @@ function rewriteHtmlResourceUrls(html, baseUrl, proxyOrigin = '') {
         return rewrittenTag;
     });
 
-    return rewrittenHtml.replace(/__PROXIT_PRESERVED_BLOCK_(\d+)__/g, (match, index) => preservedBlocks[Number(index)] || match);
+    const restoredHtml = rewrittenHtml.replace(
+        /__PROXIT_PRESERVED_BLOCK_(\d+)__/g,
+        (match, index) => preservedBlocks[Number(index)] || match
+    );
+
+    return restoredHtml.replace(/<script\b[^>]*>/gi, (tag) => {
+        return tag.replace(
+            /\b(src)=(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i,
+            (match, attr, doubleQuotedPath, singleQuotedPath, unquotedPath) => {
+                const path = doubleQuotedPath ?? singleQuotedPath ?? unquotedPath ?? '';
+                const rewrittenValue = rewriteUrlValue(path, baseUrl, proxyOrigin);
+                return `${attr}="${rewrittenValue}"`;
+            }
+        );
+    });
 }
 
 function injectProxyBaseTag(html, baseUrl) {

@@ -2,8 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { getProxyTargetUrl, globalizeClassicScriptHelpers } = require('../src/lib/proxy-http');
-const { injectProxyClientShim } = require('../src/lib/content-rewriter');
-const { rewriteUrlValue } = require('../src/lib/url-utils');
+const { injectProxyClientShim, rewriteHtmlResourceUrls } = require('../src/lib/content-rewriter');
+const { rewriteUrlValue, shouldBypassProxyForAbsoluteUrl } = require('../src/lib/url-utils');
 
 function makeProxyRequest(originalUrl) {
     const parsedUrl = new URL(`http://localhost:3000${originalUrl}`);
@@ -61,6 +61,38 @@ test('does not double-wrap URLs that already point at the local proxy', () => {
     assert.equal(
         rewrittenUrl,
         'http://localhost:3000/proxy?url=https%3A%2F%2Fgames.example%2Fplay%2Fsample-adventure'
+    );
+});
+
+test('bypasses direct-host proxying for recaptcha resources', () => {
+    assert.equal(
+        shouldBypassProxyForAbsoluteUrl('https://www.google.com/recaptcha/api2/anchor?ar=1'),
+        true
+    );
+    assert.equal(
+        shouldBypassProxyForAbsoluteUrl('https://www.gstatic.com/recaptcha/releases/example/recaptcha__en.js'),
+        true
+    );
+    assert.equal(
+        shouldBypassProxyForAbsoluteUrl('https://www.recaptcha.net/recaptcha/api.js'),
+        true
+    );
+});
+
+test('rewrites unquoted html resource attributes', () => {
+    const html = rewriteHtmlResourceUrls(
+        '<script src=https://catalog.example/assets/js/app.js></script><link href=https://catalog.example/assets/css/site.css rel=stylesheet>',
+        new URL('https://catalog.example/'),
+        'http://localhost:3000'
+    );
+
+    assert.match(
+        html,
+        /src="http:\/\/localhost:3000\/proxy\?url=https%3A%2F%2Fcatalog\.example%2Fassets%2Fjs%2Fapp\.js"/
+    );
+    assert.match(
+        html,
+        /href="http:\/\/localhost:3000\/proxy\?url=https%3A%2F%2Fcatalog\.example%2Fassets%2Fcss%2Fsite\.css"/
     );
 });
 
