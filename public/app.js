@@ -1,4 +1,45 @@
 const TARGET_URL_STORAGE_KEY = 'proxit:last-target-url';
+let currentStatusTimer = null;
+
+function getStatusElement() {
+    let status = document.getElementById('loadStatus');
+    if (!status) {
+        status = document.createElement('div');
+        status.id = 'loadStatus';
+        status.className = 'status';
+        status.setAttribute('aria-live', 'polite');
+        status.innerHTML = '<span class="status-indicator" aria-hidden="true"></span><span class="status-text"></span>';
+        document.querySelector('.header').appendChild(status);
+    }
+
+    return status;
+}
+
+function setStatus(message, state = 'idle', { autoClear = false } = {}) {
+    const status = getStatusElement();
+    const text = status.querySelector('.status-text');
+
+    status.dataset.state = state;
+    text.textContent = message;
+
+    if (currentStatusTimer) {
+        window.clearTimeout(currentStatusTimer);
+        currentStatusTimer = null;
+    }
+
+    if (autoClear) {
+        currentStatusTimer = window.setTimeout(() => {
+            status.dataset.state = 'idle';
+            text.textContent = '';
+        }, 4000);
+    }
+}
+
+function setLoadingStatus(url) {
+    const activeUrl = normalizeTargetUrl(url || document.getElementById('targetUrl').value.trim());
+    const message = activeUrl ? `Loading ${activeUrl}...` : 'Loading...';
+    setStatus(message, 'loading');
+}
 
 function normalizeTargetUrl(rawValue) {
     const value = String(rawValue || '').trim();
@@ -85,22 +126,22 @@ async function loadIframe() {
     const proxyUrl = `/proxy?url=${encodeURIComponent(url)}`;
     const iframe = document.getElementById('proxyFrame');
 
+    setLoadingStatus(url);
     iframe.src = proxyUrl;
-
-    const status = document.createElement('div');
-    status.className = 'status';
-    status.textContent = 'Loading...';
-    document.querySelector('.header').appendChild(status);
-
-    iframe.onload = () => {
-        const activeUrl = getUpstreamUrlFromIframe() || url;
-        persistTargetUrl(activeUrl);
-        status.textContent = `Loaded: ${activeUrl}`;
-        setTimeout(() => status.remove(), 3000);
-    };
 }
 
 document.getElementById('loadButton').addEventListener('click', loadIframe);
+
+document.getElementById('proxyFrame').addEventListener('load', () => {
+    const activeUrl = getUpstreamUrlFromIframe();
+    if (!activeUrl) {
+        setStatus('Page loaded', 'loaded', { autoClear: true });
+        return;
+    }
+
+    persistTargetUrl(activeUrl);
+    setStatus(`Loaded ${activeUrl}`, 'loaded', { autoClear: true });
+});
 
 document.getElementById('targetUrl').addEventListener('keypress', (event) => {
     if (event.key === 'Enter') {
@@ -110,5 +151,19 @@ document.getElementById('targetUrl').addEventListener('keypress', (event) => {
 
 window.addEventListener('load', () => {
     document.getElementById('targetUrl').value = getInitialTargetUrl();
+    setStatus('Ready', 'idle');
     setTimeout(loadIframe, 500);
+});
+
+window.addEventListener('message', (event) => {
+    if (event.origin !== window.location.origin) {
+        return;
+    }
+
+    if (!event.data || event.data.type !== 'proxit:navigating') {
+        return;
+    }
+
+    const url = typeof event.data.url === 'string' ? event.data.url : '';
+    setLoadingStatus(url);
 });

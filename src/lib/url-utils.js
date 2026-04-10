@@ -57,6 +57,23 @@ function shouldBypassProxyForAbsoluteUrl(absoluteUrl) {
     }
 }
 
+function isAlreadyProxyUrl(absoluteUrl, proxyOrigin = '') {
+    try {
+        const url = new URL(absoluteUrl, proxyOrigin || undefined);
+        if (url.pathname !== '/proxy') {
+            return false;
+        }
+
+        if (!proxyOrigin) {
+            return true;
+        }
+
+        return url.origin === proxyOrigin;
+    } catch {
+        return false;
+    }
+}
+
 function shouldLeaveUrlAlone(path) {
     return (
         !path ||
@@ -75,6 +92,9 @@ function rewriteUrlValue(path, baseUrl, proxyOrigin = '') {
 
     try {
         const absolute = new URL(path, baseUrl).href;
+        if (isAlreadyProxyUrl(absolute, proxyOrigin)) {
+            return absolute;
+        }
         if (shouldBypassProxyForAbsoluteUrl(absolute)) {
             return absolute;
         }
@@ -117,6 +137,7 @@ module.exports = {
     getProxyOrigin,
     toProxyUrl,
     unwrapProxyUrl,
+    isAlreadyProxyUrl,
     shouldBypassProxyForAbsoluteUrl,
     shouldLeaveUrlAlone,
     rewriteUrlValue,

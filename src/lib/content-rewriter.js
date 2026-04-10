@@ -92,10 +92,39 @@ function injectProxyClientShim(html, proxyOrigin) {
 
     const proxyOrigin = ${JSON.stringify(proxyOrigin)};
     const directResourceHosts = ${JSON.stringify(DIRECT_RESOURCE_HOSTS)};
+    if (typeof window.ready !== 'function') {
+        window.ready = function(callback) {
+            if (typeof callback !== 'function') {
+                return;
+            }
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', () => callback.call(document), { once: true });
+                return;
+            }
+
+            callback.call(document);
+        };
+    }
+
     const upstreamBase = (() => {
         const baseElement = document.querySelector('base[data-proxit-base]');
         return baseElement ? baseElement.href : document.baseURI;
     })();
+    const notifyParentNavigation = (url) => {
+        if (!window.parent || window.parent === window) {
+            return;
+        }
+
+        try {
+            window.parent.postMessage({
+                type: 'proxit:navigating',
+                url: String(url || '')
+            }, proxyOrigin || '*');
+        } catch {
+            // Ignore cross-window messaging failures.
+        }
+    };
     const shouldBypass = (value) => {
         if (!value) {
             return true;
@@ -251,10 +280,26 @@ function injectProxyClientShim(html, proxyOrigin) {
 
     window.open = function(url) {
         if (url) {
-            window.location.href = toProxyUrl(url);
+            const destinationUrl = toProxyUrl(url);
+            notifyParentNavigation(destinationUrl);
+            window.location.href = destinationUrl;
         }
         return window;
     };
+
+    document.addEventListener('click', (event) => {
+        const link = event.target.closest && event.target.closest('a[href]');
+        if (!link) {
+            return;
+        }
+
+        const href = link.getAttribute('href');
+        if (!href || shouldBypass(href)) {
+            return;
+        }
+
+        notifyParentNavigation(link.href || toProxyUrl(href));
+    }, true);
 
     document.addEventListener('click', (event) => {
         const link = event.target.closest && event.target.closest('a[target="_blank"]');
@@ -263,6 +308,7 @@ function injectProxyClientShim(html, proxyOrigin) {
         }
 
         event.preventDefault();
+        notifyParentNavigation(link.href);
         window.location.href = link.href;
     }, true);
 
@@ -279,6 +325,33 @@ function injectProxyClientShim(html, proxyOrigin) {
         return toAbsoluteUrl(rawAction);
     };
 
+    const buildFormSubmissionUrl = (form, submitter) => {
+        const submissionTarget = getFormSubmissionTarget(form);
+        if (!submissionTarget || shouldBypass(submissionTarget)) {
+            return submissionTarget;
+        }
+
+        const method = (form.getAttribute('method') || 'GET').toUpperCase();
+        if (method !== 'GET') {
+            return toProxyUrl(submissionTarget);
+        }
+
+        const actionUrl = new URL(submissionTarget, window.location.href);
+        const formData = typeof FormData === 'function'
+            ? new FormData(form, submitter)
+            : null;
+
+        if (formData) {
+            for (const [key, value] of formData.entries()) {
+                if (typeof value === 'string') {
+                    actionUrl.searchParams.append(key, value);
+                }
+            }
+        }
+
+        return toProxyUrl(actionUrl.href);
+    };
+
     document.addEventListener('submit', (event) => {
         const form = event.target;
         if (!(form instanceof HTMLFormElement)) {
@@ -290,10 +363,18 @@ function injectProxyClientShim(html, proxyOrigin) {
             return;
         }
 
-        form.setAttribute('action', toProxyUrl(submissionTarget));
+        const submissionUrl = buildFormSubmissionUrl(form, event.submitter);
+        form.setAttribute('action', submissionUrl);
         const target = form.getAttribute('target');
         if (target && target.toLowerCase() === '_blank') {
             form.setAttribute('target', '_self');
+        }
+
+        const method = (form.getAttribute('method') || 'GET').toUpperCase();
+        if (method === 'GET') {
+            event.preventDefault();
+            notifyParentNavigation(submissionUrl);
+            window.location.href = submissionUrl;
         }
     }, true);
 

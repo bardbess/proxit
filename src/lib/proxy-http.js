@@ -164,7 +164,21 @@ async function fetchUpstream(targetUrl, options = {}) {
 
 function getProxyTargetUrl(req) {
     if (req.path === '/proxy' && typeof req.query.url === 'string' && req.query.url) {
-        return unwrapProxyUrl(req.query.url, getProxyOrigin(req));
+        const unwrappedTargetUrl = unwrapProxyUrl(req.query.url, getProxyOrigin(req));
+
+        try {
+            const targetUrl = new URL(unwrappedTargetUrl);
+            const submittedParams = new URLSearchParams(req.query);
+            submittedParams.delete('url');
+
+            for (const [key, value] of submittedParams.entries()) {
+                targetUrl.searchParams.append(key, value);
+            }
+
+            return targetUrl.href;
+        } catch {
+            return unwrappedTargetUrl;
+        }
     }
 
     const referer = req.get('referer');
@@ -230,6 +244,13 @@ function getProxyTargetUrl(req) {
     }
 }
 
+function globalizeClassicScriptHelpers(javascript) {
+    return javascript
+        .replace(/\bconst ready =/g, 'window.ready =')
+        .replace(/\bconst ajax =/g, 'window.ajax =')
+        .replace(/\bconst \$ =/g, 'window.$ =');
+}
+
 async function proxyRequest(req, res, targetUrl) {
     const requestBody = await readRequestBody(req);
     let target = new URL(targetUrl);
@@ -273,6 +294,12 @@ async function proxyRequest(req, res, targetUrl) {
         contentType = 'application/javascript; charset=utf-8';
     }
 
+    const shouldGlobalizeClassicHelpers =
+        response.status >= 200 &&
+        response.status < 300 &&
+        contentType.includes('javascript') &&
+        req.path !== '/proxy';
+
     if (response.status >= 200 && response.status < 300 && contentType.includes('text/html')) {
         const baseUrl = new URL(target.href);
         let html = body.toString('utf8');
@@ -287,6 +314,10 @@ async function proxyRequest(req, res, targetUrl) {
             sameSite: 'lax',
             path: '/',
         });
+    } else if (shouldGlobalizeClassicHelpers) {
+        const javascript = globalizeClassicScriptHelpers(body.toString('utf8'));
+        body = Buffer.from(javascript, 'utf8');
+        bodyWasRewritten = true;
     } else if (response.status >= 200 && response.status < 300 && contentType.includes('text/css')) {
         const baseUrl = new URL(target.href);
         const css = rewriteCssResourceUrls(body.toString('utf8'), baseUrl, proxyOrigin);
@@ -314,6 +345,14 @@ async function proxyRequest(req, res, targetUrl) {
                 }
 
                 if (bodyWasRewritten && lowerKey === 'content-encoding') {
+                    return;
+                }
+
+                if (bodyWasRewritten && lowerKey === 'cache-control') {
+                    return;
+                }
+
+                if (bodyWasRewritten && lowerKey === 'expires') {
                     return;
                 }
 
@@ -350,6 +389,11 @@ async function proxyRequest(req, res, targetUrl) {
         res.setHeader('Content-Length', String(body.length));
     }
 
+    if (bodyWasRewritten) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.setHeader('Expires', '0');
+    }
+
     if (response.status === 304 || req.method === 'HEAD') {
         res.end();
         return;
@@ -360,5 +404,6 @@ async function proxyRequest(req, res, targetUrl) {
 
 module.exports = {
     getProxyTargetUrl,
+    globalizeClassicScriptHelpers,
     proxyRequest,
 };
